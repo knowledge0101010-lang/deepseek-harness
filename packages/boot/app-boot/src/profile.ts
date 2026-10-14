@@ -23,7 +23,7 @@
 
 import { createRequire } from 'node:module'
 import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import { applyEntryPatches, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
@@ -64,14 +64,63 @@ export function bundlePatchFiles(bundle: DshBundleManifest): string[] {
 }
 
 /**
+ * Whether `candidate` is `root` itself or lies inside it.
+ *
+ * `dsh.bundle.patch` is attacker-controlled: any package installed with
+ * `dsh plugin add` declares it, and the profile loader reads whatever path it
+ * names. Resolving that path with `join` alone lets `../` segments escape the
+ * package directory, so `--dump-config` prints the parsed contents of arbitrary
+ * YAML/JSON files outside the bundle. Every declared path is therefore proven to
+ * stay inside its package before it is read.
+ * @param root - absolute directory the candidate must remain inside.
+ * @param candidate - absolute path to test.
+ * @returns true when `candidate` is `root` or a descendant of it.
+ */
+export function isPathInside(root: string, candidate: string): boolean {
+  const rel = relative(resolve(root), resolve(candidate))
+  return rel === '' || (!isAbsolute(rel) && !rel.split(sep).includes('..'))
+}
+
+/**
+ * Reject a declared patch path that would leave its package directory.
+ * @param packageName - the declaring package, named in the thrown error.
+ * @param declared - the path exactly as declared in `package.json`.
+ * @throws {Error} when the path is empty, absolute, drive-relative, UNC, or has `..` segments.
+ */
+export function assertBundlePatchPath(packageName: string, declared: string): void {
+  if (declared.length === 0) {
+    throw new Error(`dsh: bundle ${JSON.stringify(packageName)} declares an empty dsh.bundle.patch`)
+  }
+  if (isAbsolute(declared) || /^[a-zA-Z]:/.test(declared) || declared.startsWith('\\\\')) {
+    throw new Error(`dsh: bundle ${JSON.stringify(packageName)} declares an absolute patch path ${JSON.stringify(declared)}; dsh.bundle.patch must be relative to the package directory`)
+  }
+  if (declared.split(/[\\/]/).includes('..')) {
+    throw new Error(`dsh: bundle ${JSON.stringify(packageName)} declares a patch path that escapes the package directory (${JSON.stringify(declared)}); '..' segments are not allowed`)
+  }
+}
+
+/**
  * Resolve a bundle declaration to its ordered absolute patch files.
+ *
+ * Every declared path is validated before it is joined, and the joined result is
+ * re-checked for containment, so a bundle cannot read outside its own package.
  * @param packageDir - absolute directory of the bundle package.
  * @param bundle - the bundle's `dsh.bundle` declaration, as read from package.json.
+ * @param packageName - the declaring package name, for error messages.
  * @returns the absolute patch file paths in application order.
- * @throws {Error} when `patch` is neither a string nor a list of strings.
+ * @throws {Error} when `patch` is neither a string nor a list of strings, or when a
+ * declared path is absolute or resolves outside `packageDir`.
  */
-export function bundlePatchPaths(packageDir: string, bundle: DshBundleManifest): string[] {
-  return bundlePatchFiles(bundle).map(file => join(packageDir, file))
+export function bundlePatchPaths(packageDir: string, bundle: DshBundleManifest, packageName = packageDir): string[] {
+  const root = resolve(packageDir)
+  return bundlePatchFiles(bundle).map(file => {
+    assertBundlePatchPath(packageName, file)
+    const resolved = resolve(join(root, file))
+    if (!isPathInside(root, resolved)) {
+      throw new Error(`dsh: bundle ${JSON.stringify(packageName)} declares a patch path that resolves outside the package directory (${JSON.stringify(file)})`)
+    }
+    return resolved
+  })
 }
 
 /** One resolved bundle layer of a profile. */
@@ -758,7 +807,7 @@ export function loadProfileDirectory(
       // A bundle is not a plugin row, so row admission never reads its own peers.
       const issue = evaluatePluginCompatibility(bundleManifest, exemptions)
       if (issue !== undefined && !issue.exempted) throw new Error(pluginCompatibilityWarning(issue))
-      const patchPaths = bundlePatchPaths(packageDir, bundle)
+      const patchPaths = bundlePatchPaths(packageDir, bundle, packageName)
       const patches = patchPaths.flatMap(patchPath => loadOverlayPatches(binName, patchPath))
       layers.push({ packageName, packageDir, patchPaths, patches })
     } catch (error) {
